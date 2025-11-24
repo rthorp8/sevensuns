@@ -13,10 +13,21 @@ import shutil
 import requests
 from pathlib import Path
 
+# HTTP session reused for downloads; set a permissive User-Agent to reduce 403s
+_HTTP_SESSION = None
+try:
+    _HTTP_SESSION = requests.Session()
+    _HTTP_SESSION.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; sevensuns/1.0; +https://github.com)"
+    })
+except Exception:
+    _HTTP_SESSION = None
+
 # Default output vault directory (can be overridden by CLI)
 VAULT_DIR = "World"
 EMBLEM_DIR = os.path.join(VAULT_DIR, "emblems")
 DOWNLOAD_EMBLEMS = False
+MFCG_DIR = None
 
 def ensure_vault_dirs(outdir):
     folders = [
@@ -99,6 +110,28 @@ def save_emblem_svg(obj_type, obj_id, svg_data):
         logging.warning("Failed to write SVG emblem %s: %s", path, e)
         return ""
 
+
+def get_emblem_for(obj_type, obj, obj_id):
+    """Resolve and save an emblem for an object.
+
+    Checks for an embedded `coa.svg` field, then `emblem_url` (local path or URL).
+    Returns the vault-relative path (e.g., 'emblems/burg-1.svg') or an empty string.
+    """
+    try:
+        # embedded SVG from COA
+        coa = obj.get("coa") if isinstance(obj, dict) else None
+        if isinstance(coa, dict) and "svg" in coa:
+            return save_emblem_svg(obj_type, obj_id, coa["svg"])
+
+        # external emblem URL or local path
+        emblem_src = obj.get("emblem_url") if isinstance(obj, dict) else None
+        if emblem_src:
+            ext = str(emblem_src).split(".")[-1]
+            return save_emblem_image(emblem_src, obj_type, obj_id, ext, download=DOWNLOAD_EMBLEMS)
+    except Exception as e:
+        logging.warning("Failed to resolve emblem for %s %s: %s", obj_type, obj_id, e)
+    return ""
+
 def save_emblem_image(src_path, obj_type, obj_id, ext="png", download=False):
     filename = f"{obj_type}-{obj_id}.{ext}"
     dst_path = os.path.join(EMBLEM_DIR, filename)
@@ -108,7 +141,8 @@ def save_emblem_image(src_path, obj_type, obj_id, ext="png", download=False):
             logging.warning("Emblem URL provided but --download-emblems not set: %s", src_path)
             return ""
         try:
-            resp = requests.get(src_path, stream=True, timeout=10)
+            sess = _HTTP_SESSION or requests
+            resp = sess.get(src_path, stream=True, timeout=10)
             resp.raise_for_status()
             # Ensure emblem dir exists
             os.makedirs(EMBLEM_DIR, exist_ok=True)
@@ -154,8 +188,93 @@ def save_emblem_image(src_path, obj_type, obj_id, ext="png", download=False):
         logging.warning("Failed to copy emblem %s -> %s: %s", src_path, dst_path, e)
         return ""
 
+
+def integrate_mfcg_assets(burg_id, burg_name, mfcg_root, outdir):
+    """Find and copy MFCG outputs that match a burg into the vault.
+
+    Strategy:
+    - Look for directories in `mfcg_root` matching `burg-<id>`, `<id>`, or the safe filename of the burg name.
+    - If found, copy their contents into `outdir/Burgs/Burg-<id>-<safe_name>/mfcg/<folder>`
+    - If no matching folders, search for files in `mfcg_root` that contain the id or safe name and copy them into the per-burg mfcg folder.
+
+    Returns a list of vault-relative paths to the copied files (empty list if none).
+    """
+    try:
+        if not mfcg_root:
+            return []
+        src_root = os.path.abspath(mfcg_root)
+        if not os.path.exists(src_root):
+            logging.debug("MFCG root not found: %s", src_root)
+            return []
+
+        safe_name = safe_filename(burg_name)
+        candidates = []
+        # look for matching directories
+        for entry in os.listdir(src_root):
+            entry_low = entry.lower()
+            if entry_low in (f"burg-{burg_id}", str(burg_id), safe_name.lower()) or \
+               f"burg-{burg_id}" in entry_low or safe_name.lower() in entry_low:
+                cand = os.path.join(src_root, entry)
+                candidates.append(cand)
+
+        dest_base = os.path.join(outdir, "Burgs", f"Burg-{burg_id}-{safe_name}", "mfcg")
+        os.makedirs(dest_base, exist_ok=True)
+        copied = []
+
+        # If candidate directories exist, copy them (preserve inner structure)
+        for c in candidates:
+            if os.path.isdir(c):
+                # copy folder contents into subfolder named after the source
+                dest_sub = os.path.join(dest_base, os.path.basename(c))
+                # If dest_sub exists, use it; otherwise copytree
+                if os.path.exists(dest_sub):
+                    logging.debug("MFCG dest already exists, skipping copy: %s", dest_sub)
+                else:
+                    try:
+                        shutil.copytree(c, dest_sub)
+                    except Exception:
+                        # fallback: copy files inside
+                        os.makedirs(dest_sub, exist_ok=True)
+                        for root, dirs, files in os.walk(c):
+                            rel = os.path.relpath(root, c)
+                            target_root = os.path.join(dest_sub, rel) if rel != '.' else dest_sub
+                            os.makedirs(target_root, exist_ok=True)
+                            for f in files:
+                                shutil.copy(os.path.join(root, f), os.path.join(target_root, f))
+                # Collect vault-relative paths
+                for root, _, files in os.walk(dest_sub):
+                    for f in files:
+                        rel = os.path.relpath(os.path.join(root, f), outdir).replace('\\', '/')
+                        copied.append(rel)
+
+        # Also try file matches at root (do this even if directories copied so we
+        # include both kinds of assets when present)
+        #
+        # This copies any file at the root of mfcg_root whose name contains a
+        # matching token (burg-id or safe name).
+            for entry in os.listdir(src_root):
+                entry_low = entry.lower()
+                if (f"burg-{burg_id}" in entry_low) or (str(burg_id) in entry_low) or (safe_name.lower() in entry_low):
+                    abs_src = os.path.join(src_root, entry)
+                    if os.path.isfile(abs_src):
+                        dst = os.path.join(dest_base, entry)
+                        try:
+                            shutil.copy(abs_src, dst)
+                            rel = os.path.relpath(dst, outdir).replace('\\', '/')
+                            copied.append(rel)
+                        except Exception as e:
+                            logging.warning("Failed to copy MFCG file %s -> %s: %s", abs_src, dst, e)
+
+        return copied
+    except Exception as e:
+        logging.warning("Unexpected error integrating MFCG assets for %s: %s", burg_id, e)
+        return []
+
 def process_cells(pack):
     cells = pack.get("cells", {})
+    # Some packs may provide `cells` as a list of heights instead of a dict
+    if isinstance(cells, list):
+        cells = {"h": cells}
     heights = cells.get("h", [])
     for cid, elev in enumerate(heights):
         try:
@@ -206,12 +325,7 @@ def process_burgs(burgs):
             if not isinstance(b, dict):
                 logging.warning("Skipping non-dict burg entry: %s", repr(b))
                 continue
-            emblem_url = ""
-            if "coa" in b and isinstance(b["coa"], dict) and "svg" in b["coa"]:
-                emblem_url = save_emblem_svg("burg", b.get("i", "unknown"), b["coa"]["svg"])
-            elif "emblem_url" in b:
-                ext = str(b["emblem_url"]).split(".")[-1]
-                emblem_url = save_emblem_image(b["emblem_url"], "burg", b.get("i", "unknown"), ext, download=DOWNLOAD_EMBLEMS)
+            emblem_url = get_emblem_for("burg", b, b.get("i", "unknown"))
             fm = {
                 "burg_id": b.get("i", 0),
                 "name": b.get("name", ""),
@@ -232,6 +346,14 @@ def process_burgs(burgs):
         except Exception as e:
             logging.warning("Skipping burg entry due to error: %s", e)
             continue
+        # Integrate Medieval Fantasy City Generator (MFCG) assets, if a source dir was provided
+        mfcg_assets = []
+        try:
+            if isinstance(MFCG_DIR, str) and MFCG_DIR:
+                mfcg_assets = integrate_mfcg_assets(fm['burg_id'], fm['name'], MFCG_DIR, VAULT_DIR)
+        except Exception:
+            logging.debug("MFCG asset integration failed for burg %s", fm.get('burg_id'))
+
         body = (
             f"# Burg {fm['name']}\n"
             f"{f'![Emblem]({fm['emblem_url']})' if fm['emblem_url'] else ''}\n"
@@ -240,6 +362,15 @@ def process_burgs(burgs):
             f"State → [[States/State-{fm['state']}]]\n"
             f"Feature → [[Features/Feature-{fm['feature']}]]"
         )
+        # Append links to any integrated MFCG assets
+        if mfcg_assets:
+            body += "\n\nMFCG assets:\n"
+            for a in mfcg_assets:
+                # a is a vault-relative path
+                body += f"- [{os.path.basename(a)}]({a})\n"
+            fm['mfcg_assets'] = mfcg_assets
+        else:
+            fm['mfcg_assets'] = []
         filename = f"Burg-{fm['burg_id']}-{safe_filename(fm['name'])}.md"
         path = os.path.join(VAULT_DIR, "Burgs", filename)
         write_markdown(path, fm, body)
@@ -253,12 +384,7 @@ def process_states(states):
             if not isinstance(s, dict):
                 logging.warning("Skipping non-dict state entry: %s", repr(s))
                 continue
-            emblem_url = ""
-            if "coa" in s and isinstance(s["coa"], dict) and "svg" in s["coa"]:
-                emblem_url = save_emblem_svg("state", s.get("i", "unknown"), s["coa"]["svg"])
-            elif "emblem_url" in s:
-                ext = str(s["emblem_url"]).split(".")[-1]
-                emblem_url = save_emblem_image(s["emblem_url"], "state", s.get("i", "unknown"), ext, download=DOWNLOAD_EMBLEMS)
+            emblem_url = get_emblem_for("state", s, s.get("i", "unknown"))
             fm = {
                 "state_id": s.get("i", 0),
                 "name": s.get("name", ""),
@@ -292,12 +418,7 @@ def process_provinces(provinces):
             if not isinstance(p, dict):
                 logging.warning("Skipping non-dict province entry: %s", repr(p))
                 continue
-            emblem_url = ""
-            if "coa" in p and isinstance(p["coa"], dict) and "svg" in p["coa"]:
-                emblem_url = save_emblem_svg("province", p.get("i", "unknown"), p["coa"]["svg"])
-            elif "emblem_url" in p:
-                ext = str(p["emblem_url"]).split(".")[-1]
-                emblem_url = save_emblem_image(p["emblem_url"], "province", p.get("i", "unknown"), ext, download=DOWNLOAD_EMBLEMS)
+            emblem_url = get_emblem_for("province", p, p.get("i", "unknown"))
             fm = {
                 "province_id": p.get("i", 0),
                 "name": p.get("name", ""),
@@ -329,12 +450,7 @@ def process_cultures(cultures):
             if not isinstance(c, dict):
                 logging.warning("Skipping non-dict culture entry: %s", repr(c))
                 continue
-            emblem_url = ""
-            if "coa" in c and isinstance(c["coa"], dict) and "svg" in c["coa"]:
-                emblem_url = save_emblem_svg("culture", c.get("i", "unknown"), c["coa"]["svg"])
-            elif "emblem_url" in c:
-                ext = str(c["emblem_url"]).split(".")[-1]
-                emblem_url = save_emblem_image(c["emblem_url"], "culture", c.get("i", "unknown"), ext, download=DOWNLOAD_EMBLEMS)
+            emblem_url = get_emblem_for("culture", c, c.get("i", "unknown"))
             fm = {
                 "culture_id": c.get("i", 0),
                 "name": c.get("name", ""),
@@ -366,12 +482,7 @@ def process_religions(religions):
             if not isinstance(r, dict):
                 logging.warning("Skipping non-dict religion entry: %s", repr(r))
                 continue
-            emblem_url = ""
-            if "coa" in r and isinstance(r["coa"], dict) and "svg" in r["coa"]:
-                emblem_url = save_emblem_svg("religion", r.get("i", "unknown"), r["coa"]["svg"])
-            elif "emblem_url" in r:
-                ext = str(r["emblem_url"]).split(".")[-1]
-                emblem_url = save_emblem_image(r["emblem_url"], "religion", r.get("i", "unknown"), ext, download=DOWNLOAD_EMBLEMS)
+            emblem_url = get_emblem_for("religion", r, r.get("i", "unknown"))
             fm = {
                 "religion_id": r.get("i", 0),
                 "name": r.get("name", ""),
@@ -403,12 +514,7 @@ def process_features(features):
             if not isinstance(f, dict):
                 logging.warning("Skipping non-dict feature entry: %s", repr(f))
                 continue
-            emblem_url = ""
-            if "coa" in f and isinstance(f["coa"], dict) and "svg" in f["coa"]:
-                emblem_url = save_emblem_svg("feature", f.get("i", "unknown"), f["coa"]["svg"])
-            elif "emblem_url" in f:
-                ext = str(f["emblem_url"]).split(".")[-1]
-                emblem_url = save_emblem_image(f["emblem_url"], "feature", f.get("i", "unknown"), ext, download=DOWNLOAD_EMBLEMS)
+            emblem_url = get_emblem_for("feature", f, f.get("i", "unknown"))
             fm = {
                 "feature_id": f.get("i", 0),
                 "type": f.get("type", ""),
@@ -464,6 +570,7 @@ if __name__ == "__main__":
     parser.add_argument("mapfile", help="Path to FMG exported JSON (map.json)")
     parser.add_argument("--outdir", "-o", default="World", help="Output vault directory (default: World)")
     parser.add_argument("--download-emblems", action="store_true", help="Download emblem URLs (HTTP/HTTPS) instead of expecting local files")
+    parser.add_argument("--mfcg-dir", default=None, help="Optional: directory containing Medieval Fantasy City Generator outputs to attach to matching Burgs")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
     args = parser.parse_args()
 
@@ -473,6 +580,7 @@ if __name__ == "__main__":
     VAULT_DIR = args.outdir
     EMBLEM_DIR = os.path.join(VAULT_DIR, "emblems")
     DOWNLOAD_EMBLEMS = args.download_emblems
+    MFCG_DIR = args.mfcg_dir
 
     ensure_vault_dirs(VAULT_DIR)
 

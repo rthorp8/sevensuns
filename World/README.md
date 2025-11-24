@@ -22,6 +22,21 @@ python fmg_to_obsidian_Version3.py map.json
 
 - If `emblem_url` points to an HTTP URL, the current script does not download it — it expects a local path. Add a downloader flag (for example `--download-emblems`) if you want automatic HTTP fetching.
 
+MFCG (Medieval Fantasy City Generator) integration
+-----------------------------------------------
+
+If you have outputs from the Medieval Fantasy City Generator (MFCG) you can attach them to matching Burg pages during conversion. Provide the path to the folder containing MFCG exports using the `--mfcg-dir` CLI flag.
+
+Behavior:
+- The converter searches the provided directory for folders or files that match a burg by ID or name (examples: `Burg-1`, `1`, `Stonehaven`, `Burg-1-Stonehaven`).
+- If matches are found the script copies those files/folders into `World/Burgs/Burg-<id>-<name>/mfcg/` and adds a `mfcg_assets` frontmatter list with vault-relative paths and links in the generated Markdown.
+
+Example usage:
+
+```powershell
+python .\fmg_to_obsidian_Version3.py .\map.json --outdir World --mfcg-dir C:\path\to\mfcg-exports
+```
+
 Local emblems
 -------------
 
