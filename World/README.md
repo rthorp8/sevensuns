@@ -50,4 +50,25 @@ Example usage:
 python .\fmg_to_obsidian_Version3.py .\map.json --outdir World --download-emblems
 ```
 
+MFCG matching, dedupe and ZIP options
+-----------------------------------
+
+The converter offers extra control when attaching Medieval Fantasy City Generator (MFCG) assets:
+
+- `--mfcg-match` (default: fuzzy) — matching strategy for finding MFCG assets in the provided `--mfcg-dir`:
+	- `fuzzy` — case-insensitive substring checks (matches many common names)
+	- `exact` — strict filename equality against `burg-<id>`, `<id>`, or the sanitized burg name
+	- `regex` — provide a Python regular expression with `--mfcg-match-pattern` to match filenames
+	- `map` — use a JSON map file (`--mfcg-map-file`) containing explicit mappings from burg ids/names to relative asset paths
+
+- `--mfcg-dedupe` — enable deduplication by file content (sha256). If a matching file already exists in the vault with identical content, the converter will reuse the existing vault-relative path instead of copying a duplicate.
+
+- `--mfcg-zip` — after copying matched assets, create a per-burg ZIP archive and remove the individual copied files (saves space for large exports). The converter returns a single archive path as the `mfcg_assets` entry when this mode is used.
+
+Example:
+
+```powershell
+python .\fmg_to_obsidian_Version3.py map.json --outdir World --mfcg-dir C:\mfcg-exports --mfcg-match exact --mfcg-dedupe --mfcg-zip
+```
+
 If you prefer not to download remote images, set `emblem_url` to a local absolute path and run the converter without `--download-emblems`.

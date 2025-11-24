@@ -11,6 +11,8 @@ import os
 import re
 import shutil
 import requests
+import hashlib
+import zipfile
 from pathlib import Path
 
 # HTTP session reused for downloads; set a permissive User-Agent to reduce 403s
@@ -28,6 +30,11 @@ VAULT_DIR = "World"
 EMBLEM_DIR = os.path.join(VAULT_DIR, "emblems")
 DOWNLOAD_EMBLEMS = False
 MFCG_DIR = None
+MFCG_MATCH_MODE = "fuzzy"  # fuzzy | exact | regex | map
+MFCG_MATCH_PATTERN = None
+MFCG_MAP_FILE = None
+MFCG_DEDUPE = False
+MFCG_ZIP = False
 
 def ensure_vault_dirs(outdir):
     folders = [
@@ -209,17 +216,43 @@ def integrate_mfcg_assets(burg_id, burg_name, mfcg_root, outdir):
 
         safe_name = safe_filename(burg_name)
         candidates = []
-        # look for matching directories
+        # look for matching directories using selected match mode
         for entry in os.listdir(src_root):
             entry_low = entry.lower()
-            if entry_low in (f"burg-{burg_id}", str(burg_id), safe_name.lower()) or \
-               f"burg-{burg_id}" in entry_low or safe_name.lower() in entry_low:
+            match_ok = False
+            if MFCG_MATCH_MODE == 'fuzzy':
+                match_ok = (entry_low in (f"burg-{burg_id}", str(burg_id), safe_name.lower()) or
+                            f"burg-{burg_id}" in entry_low or safe_name.lower() in entry_low)
+            elif MFCG_MATCH_MODE == 'exact':
+                match_ok = entry_low in (f"burg-{burg_id}", str(burg_id), safe_name.lower(), f"burg-{burg_id}-{safe_name.lower()}")
+            elif MFCG_MATCH_MODE == 'regex' and MFCG_MATCH_PATTERN:
+                try:
+                    if re.search(MFCG_MATCH_PATTERN, entry, flags=re.IGNORECASE):
+                        match_ok = True
+                except re.error:
+                    match_ok = False
+            # in 'map' mode we will rely on the provided mapping file instead of filename matching
+            if match_ok:
                 cand = os.path.join(src_root, entry)
                 candidates.append(cand)
 
         dest_base = os.path.join(outdir, "Burgs", f"Burg-{burg_id}-{safe_name}", "mfcg")
         os.makedirs(dest_base, exist_ok=True)
         copied = []
+        # If dedupe is enabled, build a map of existing file hashes to vault-relative paths
+        existing_hashes = {}
+        if MFCG_DEDUPE:
+            try:
+                for root, _, files in os.walk(outdir):
+                    for f in files:
+                        p = os.path.join(root, f)
+                        try:
+                            h = hashlib.sha256(open(p, 'rb').read()).hexdigest()
+                            existing_hashes[h] = os.path.relpath(p, outdir).replace('\\', '/')
+                        except Exception:
+                            continue
+            except Exception:
+                existing_hashes = {}
 
         # If candidate directories exist, copy them (preserve inner structure)
         for c in candidates:
@@ -247,23 +280,128 @@ def integrate_mfcg_assets(burg_id, burg_name, mfcg_root, outdir):
                         rel = os.path.relpath(os.path.join(root, f), outdir).replace('\\', '/')
                         copied.append(rel)
 
-        # Also try file matches at root (do this even if directories copied so we
-        # include both kinds of assets when present)
-        #
-        # This copies any file at the root of mfcg_root whose name contains a
-        # matching token (burg-id or safe name).
-            for entry in os.listdir(src_root):
-                entry_low = entry.lower()
-                if (f"burg-{burg_id}" in entry_low) or (str(burg_id) in entry_low) or (safe_name.lower() in entry_low):
-                    abs_src = os.path.join(src_root, entry)
-                    if os.path.isfile(abs_src):
-                        dst = os.path.join(dest_base, entry)
+        # Also try file matches at root (do this even if directories copied so
+        # we include both kinds of assets when present). Behavior depends on
+        # matching mode.
+
+        # If using a mapping file, resolve explicit targets first
+        if MFCG_MATCH_MODE == 'map' and MFCG_MAP_FILE:
+            try:
+                map_path = os.path.abspath(MFCG_MAP_FILE)
+                if os.path.exists(map_path):
+                    with open(map_path, 'r', encoding='utf-8') as mf:
+                        mapping = json.load(mf)
+                    targets = mapping.get(str(burg_id)) or mapping.get(str(burg_id).lower()) or mapping.get(safe_name) or mapping.get(safe_name.lower())
+                    if isinstance(targets, (list, tuple)):
+                        for t in targets:
+                            abs_src = os.path.join(src_root, t)
+                            if os.path.isdir(abs_src):
+                                dest_sub = os.path.join(dest_base, os.path.basename(abs_src))
+                                if not os.path.exists(dest_sub):
+                                    try:
+                                        shutil.copytree(abs_src, dest_sub)
+                                    except Exception:
+                                        os.makedirs(dest_sub, exist_ok=True)
+                                        for root, _, files in os.walk(abs_src):
+                                            rel = os.path.relpath(root, abs_src)
+                                            target_root = os.path.join(dest_sub, rel) if rel != '.' else dest_sub
+                                            os.makedirs(target_root, exist_ok=True)
+                                            for f in files:
+                                                shutil.copy(os.path.join(root, f), os.path.join(target_root, f))
+                                for root, _, files in os.walk(dest_sub):
+                                    for f in files:
+                                        rel = os.path.relpath(os.path.join(root, f), outdir).replace('\\', '/')
+                                        copied.append(rel)
+                            elif os.path.isfile(abs_src):
+                                # dedupe by hash
+                                try:
+                                    src_hash = hashlib.sha256(open(abs_src, 'rb').read()).hexdigest()
+                                except Exception:
+                                    src_hash = None
+                                if MFCG_DEDUPE and src_hash and src_hash in existing_hashes:
+                                    copied.append(existing_hashes[src_hash])
+                                else:
+                                    dst = os.path.join(dest_base, os.path.basename(abs_src))
+                                    try:
+                                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                                        shutil.copy(abs_src, dst)
+                                        rel = os.path.relpath(dst, outdir).replace('\\', '/')
+                                        copied.append(rel)
+                                        if src_hash:
+                                            existing_hashes[src_hash] = rel
+                                    except Exception as e:
+                                        logging.warning("Failed to copy mapped MFCG file %s -> %s: %s", abs_src, dst, e)
+            except Exception as e:
+                logging.debug("Failed to load MFCG map file %s: %s", MFCG_MAP_FILE, e)
+
+        # Generic file matching for fuzzy/exact/regex modes
+        for entry in os.listdir(src_root):
+            entry_low = entry.lower()
+            abs_src = os.path.join(src_root, entry)
+            if not os.path.isfile(abs_src):
+                continue
+            match_ok = False
+            if MFCG_MATCH_MODE == 'fuzzy':
+                match_ok = (f"burg-{burg_id}" in entry_low) or (str(burg_id) in entry_low) or (safe_name.lower() in entry_low)
+            elif MFCG_MATCH_MODE == 'exact':
+                match_ok = entry_low in (f"burg-{burg_id}", str(burg_id), safe_name.lower(), f"burg-{burg_id}-{safe_name.lower()}")
+            elif MFCG_MATCH_MODE == 'regex' and MFCG_MATCH_PATTERN:
+                try:
+                    if re.search(MFCG_MATCH_PATTERN, entry, flags=re.IGNORECASE):
+                        match_ok = True
+                except re.error:
+                    match_ok = False
+
+            if not match_ok:
+                continue
+
+            # dedupe by content hash if enabled
+            try:
+                src_hash = hashlib.sha256(open(abs_src, 'rb').read()).hexdigest()
+            except Exception:
+                src_hash = None
+
+            if MFCG_DEDUPE and src_hash and src_hash in existing_hashes:
+                copied.append(existing_hashes[src_hash])
+                continue
+
+            dst = os.path.join(dest_base, entry)
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy(abs_src, dst)
+                rel = os.path.relpath(dst, outdir).replace('\\', '/')
+                copied.append(rel)
+                if src_hash:
+                    existing_hashes[src_hash] = rel
+            except Exception as e:
+                logging.warning("Failed to copy MFCG file %s -> %s: %s", abs_src, dst, e)
+
+        # If zip mode is enabled, compress the copied files into a single zip and
+        # remove the copied files afterwards to save space.
+        if MFCG_ZIP and copied:
+            try:
+                zip_name = os.path.join(outdir, 'Burgs', f"Burg-{burg_id}-{safe_name}", f"mfcg-{burg_id}.zip")
+                with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as z:
+                    for rel in copied:
+                        abs_f = os.path.join(outdir, rel)
+                        arcname = os.path.relpath(abs_f, os.path.join(outdir, 'Burgs', f"Burg-{burg_id}-{safe_name}"))
                         try:
-                            shutil.copy(abs_src, dst)
-                            rel = os.path.relpath(dst, outdir).replace('\\', '/')
-                            copied.append(rel)
-                        except Exception as e:
-                            logging.warning("Failed to copy MFCG file %s -> %s: %s", abs_src, dst, e)
+                            z.write(abs_f, arcname)
+                        except Exception:
+                            pass
+                # Remove individual copied files/dirs
+                for rel in copied:
+                    try:
+                        abs_f = os.path.join(outdir, rel)
+                        if os.path.isfile(abs_f):
+                            os.remove(abs_f)
+                        else:
+                            shutil.rmtree(abs_f, ignore_errors=True)
+                    except Exception:
+                        pass
+                return [os.path.relpath(zip_name, outdir).replace('\\', '/')]
+            except Exception as e:
+                logging.warning("Failed to create MFCG zip for burg %s: %s", burg_id, e)
 
         return copied
     except Exception as e:
@@ -571,6 +709,11 @@ if __name__ == "__main__":
     parser.add_argument("--outdir", "-o", default="World", help="Output vault directory (default: World)")
     parser.add_argument("--download-emblems", action="store_true", help="Download emblem URLs (HTTP/HTTPS) instead of expecting local files")
     parser.add_argument("--mfcg-dir", default=None, help="Optional: directory containing Medieval Fantasy City Generator outputs to attach to matching Burgs")
+    parser.add_argument("--mfcg-match", default="fuzzy", choices=["fuzzy", "exact", "regex", "map"], help="Matching strategy for detecting MFCG assets: fuzzy (default), exact, regex, or map")
+    parser.add_argument("--mfcg-match-pattern", default=None, help="Regex pattern used when --mfcg-match=regex (Python re syntax)")
+    parser.add_argument("--mfcg-map-file", default=None, help="JSON file mapping burg ids/names to relative MFCG paths (used when --mfcg-match=map)")
+    parser.add_argument("--mfcg-dedupe", action="store_true", help="Enable deduplication by content (sha256) across vault files for MFCG assets")
+    parser.add_argument("--mfcg-zip", action="store_true", help="Package matched MFCG assets into a per-burg ZIP and remove individual copies (saves space)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
     args = parser.parse_args()
 
@@ -581,6 +724,11 @@ if __name__ == "__main__":
     EMBLEM_DIR = os.path.join(VAULT_DIR, "emblems")
     DOWNLOAD_EMBLEMS = args.download_emblems
     MFCG_DIR = args.mfcg_dir
+    MFCG_MATCH_MODE = args.mfcg_match
+    MFCG_MATCH_PATTERN = args.mfcg_match_pattern
+    MFCG_MAP_FILE = args.mfcg_map_file
+    MFCG_DEDUPE = args.mfcg_dedupe
+    MFCG_ZIP = args.mfcg_zip
 
     ensure_vault_dirs(VAULT_DIR)
 

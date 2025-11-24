@@ -43,6 +43,7 @@ If you need to extend the project
 - Add a small README snippet under `World/` describing generated file naming for maintainers.
 - If adding HTTP emblem fetching, add a flag (e.g., `--download-emblems`) and keep backwards compatibility for local `emblem_url` paths.
 - If you want to attach Medieval Fantasy City Generator outputs to Burg pages, add a `--mfcg-dir` flag and implement per-burg copy/link behavior. See `World/README.md` for expected behavior and examples.
+- To control MFCG matching behavior you can use `--mfcg-match` (fuzzy|exact|regex|map), `--mfcg-match-pattern` for regex, `--mfcg-map-file` for explicit mappings. Also supported: `--mfcg-dedupe` (content dedupe) and `--mfcg-zip` (package assets per-burg into a zip).
 
 Questions or unclear areas
 - The top-level `README.md` is minimal; tell me how much more detail you'd like (usage examples, sample `map.json`, CI commands) and I will update this file.
